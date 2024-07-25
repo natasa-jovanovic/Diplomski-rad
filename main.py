@@ -1,92 +1,56 @@
-import gymnasium as gym
-import torch
-from agent import SACAgent
-from replay_buffer import ReplayBuffer
-from config import Config
-import wandb
-import metaworld
+import Metaworld.metaworld as metaworld
 import random
 
-def main(config=None):
+import gymnasium as gym
+import wandb
+from wandb.integration.sb3 import WandbCallback
+import numpy as np
+from scripts.sac.sac import SAC
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
 
-    with wandb.init(config=config):
+def make_env(env_name, i):
+    def _init():
+        ml1 = metaworld.ML1(env_name)
 
-        cfg = Config()
-
-        ml1 = metaworld.ML1(cfg.env_name)
-        testing_envs = []
-        for name, env_cls in ml1.train_classes.items():
-            env = env_cls()  # Create an environment
-            task = random.choice([task for task in ml1.train_tasks
-                                    if task.env_name == name])
-            env.set_task(task)
-            testing_envs.append(env)
-
-        replay_buffer = ReplayBuffer(cfg.replay_buffer_size)
-        agent = SACAgent(env.observation_space.shape[0], env.action_space.shape[0], cfg)
-        config = wandb.config
-
-        cfg.hidden_dim = config.hidden_dim
-        cfg.gamma = config.gamma
-        cfg.learning_rate = config.learning_rate
-        cfg.batch_size = config.batch_size
+        env = ml1.train_classes[env_name](render_mode='rgb_array')  # Create an environment with task `pick_place`
+        task = random.choice(ml1.train_tasks)
+        env.set_task(task)  # Set task
+        env = gym.wrappers.RecordVideo(env, f"videos")  # record videos
+        env = gym.wrappers.RecordEpisodeStatistics(env)  # record stats such as returns
+        return env
+    
+    return _init
 
 
-        for episode in range(cfg.max_episodes):
-            state, _ = env.reset()
-            episode_reward = 0
 
-            for t in range(cfg.max_timesteps):
-                action = agent.select_action(state)
-                next_state, reward, done, _, _ = env.step(action)
-                replay_buffer.add(state, action, reward, next_state, done)
-                agent.update(replay_buffer)
+env_names = ["drawer-open-v2"]
+env_fns = [make_env(env_name, i) for i, env_name in enumerate(env_names)]
 
-                state = next_state
-                episode_reward += reward
+config = {
+    "policy_type": 'MlpPolicy',
+    "total_timesteps": 300000,
+#    "env_name": [ "door-open-v2", "drawer-open-v2" ]
+    "env_name": env_names
+}
 
-                if done:
-                    break
-            wandb.log({"Reward": episode_reward})
+run = wandb.init(
+    config=config,
+    sync_tensorboard=True,  # automatically upload SB3's tensorboard metrics to W&B
+    project="MetaWorld-SAC",
+    monitor_gym=True,       # automatically upload gym environements' videos
+    save_code=True,
+)
 
-if __name__ == "__main__":
+env = DummyVecEnv(env_fns)
+model = PPO(config["policy_type"], env, verbose=1, tensorboard_log=f"runs/{run.id}")
 
-    sweep_config = {
-        'method': 'random'
-    }
+model.learn(
+    total_timesteps=config["total_timesteps"],
+    callback=WandbCallback(
+        model_save_path=f"models/{run.id}",
+        verbose=2,
+    ),
+)
 
-    metric = {
-        'name': 'Reward',
-        'goal': 'maximize'   
-    }
-
-    sweep_config['metric'] = metric
-
-    parameters_dict = {
-        'hidden_dim': {
-            'values': [128, 256, 512]
-        },
-        'gamma': {
-            'values': [0.99, 0.995]
-        }
-    }
-
-    parameters_dict.update({
-        'learning_rate': {
-            'distribution': 'uniform',
-            'min': 1e-4,
-            'max': 1e-3
-        },
-        'batch_size': {
-            'distribution': 'q_log_uniform_values',
-            'q': 8,
-            'min': 32,
-            'max': 256,
-        }
-    })
-    sweep_config['parameters'] = parameters_dict
-
-    sweep_id = wandb.sweep(sweep_config, project="sac-pytorch")
-    wandb.agent(sweep_id, function=main)
-
-    #main()
+run.finish()
